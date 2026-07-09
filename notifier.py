@@ -1,0 +1,505 @@
+#!/usr/bin/env python3
+"""
+APN Lodge Notifier — GitHub Actions edition, Google Calendar sync.
+
+Runs on GH Actions cron. On each run:
+  1. Scrapes ALL events on both Future and Past tabs of the Kipu portal.
+  2. Syncs those events into the "APN Lodge" Google Calendar via Service Account.
+     - Insert new, update changed, delete Kipu-owned events no longer on Kipu.
+     - Each managed event carries extendedProperties.private.kipu_key so we
+       never touch events created by the user manually.
+  3. On the FIRST run, also inserts three recurring daily meal events
+     (Breakfast, Lunch, Dinner) as ours-forever events.
+  4. Sends SMS "Your schedule has changed" via Verizon vtext if today's items
+     changed vs. the last snapshot.
+
+Reminders are handled natively by Google Calendar per-event:
+  * Kipu events: 30-min popup, except any name in SKIP_REMINDER_NAMES
+    (e.g. "Vitals & Med Pass in Nursing") → no reminder.
+  * Meals: no reminder.
+
+State (`.state.json`) is committed alongside the workflow run so it persists
+across the ephemeral Actions runners.
+
+Env vars (all from GitHub Secrets):
+  KIPU_USER, KIPU_PASSWORD
+  GMAIL_USER, GMAIL_APP_PASSWORD, NOTIFY_TO
+  GCAL_SA_JSON        (full JSON contents of the service account key)
+  GCAL_CALENDAR_ID    (the APN Lodge calendar ID)
+  APN_TIMEZONE        (optional, default America/Denver)
+"""
+import hashlib
+import json
+import logging
+import os
+import re
+import smtplib
+import ssl
+import sys
+import tempfile
+from datetime import datetime, timedelta, date
+from email.message import EmailMessage
+from pathlib import Path
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    from backports.zoneinfo import ZoneInfo
+
+try:
+    import certifi
+    _CAFILE = certifi.where()
+except ImportError:
+    _CAFILE = None
+
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+
+# -----------------------------------------------------------------------------
+# Config from env
+# -----------------------------------------------------------------------------
+def env(key, required=True, default=None):
+    v = os.environ.get(key, default)
+    if required and not v:
+        sys.exit(f"missing required env var {key}")
+    return v
+
+
+CFG = {
+    "kipu_url": "https://apn11031.kipuworks.com/portal/sign_in",
+    "kipu_appointments_url": "https://apn11031.kipuworks.com/portal/appointments?account_id=160244",
+    "kipu_user": env("KIPU_USER"),
+    "kipu_password": env("KIPU_PASSWORD"),
+    "gmail_user": env("GMAIL_USER"),
+    "gmail_app_password": env("GMAIL_APP_PASSWORD"),
+    "notify_to": env("NOTIFY_TO"),
+    "gcal_sa_json": env("GCAL_SA_JSON"),
+    "gcal_calendar_id": env("GCAL_CALENDAR_ID"),
+    "timezone": env("APN_TIMEZONE", required=False, default="America/Denver"),
+    # Reminders on the calendar itself — no separate SMS reminders.
+    "skip_reminder_names": ["Vitals & Med Pass in Nursing"],
+    "reminder_minutes": 30,
+    # Duration guesses when Kipu only gives start times.
+    "default_event_minutes": 60,
+    "short_event_minutes": 15,
+    "short_event_hint": "Vitals & Med Pass",
+}
+
+CWD = Path.cwd()
+STATE_PATH = CWD / ".state.json"
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("apn")
+
+
+# -----------------------------------------------------------------------------
+# Scrape (full history)
+# -----------------------------------------------------------------------------
+def _strip_instructor(title, provider):
+    if not provider:
+        return title
+    first_seg = provider.split(",", 1)[0].strip()
+    parts = first_seg.split()
+    for n in range(min(len(parts), 3), 0, -1):
+        prefix = " ".join(parts[:n])
+        if title.startswith(prefix + " "):
+            return title[len(prefix):].strip()
+        if title == prefix:
+            return "(private)"
+    return title
+
+
+def _parse_location(title):
+    m = re.search(r"\bin the (.+?)(?:\s*\(|$)", title, re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    m = re.search(r"\(Location\s*:\s*([^)]+)\)", title, re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    m = re.search(r"\bin (?!the\b)([A-Z][^,]+)$", title)
+    if m:
+        return m.group(1).strip()
+    return ""
+
+
+def _parse_row(cells):
+    if len(cells) < 6:
+        return None
+    date_idx = None
+    for i, c in enumerate(cells):
+        if re.fullmatch(r"\d{2}/\d{2}/\d{4}", c):
+            date_idx = i
+            break
+    if date_idx is None:
+        return None
+    try:
+        date_str = cells[date_idx]
+        time_str = cells[date_idx + 1]
+        provider = cells[date_idx + 3] if len(cells) > date_idx + 3 else ""
+        title = cells[date_idx + 4] if len(cells) > date_idx + 4 else ""
+        if not title:
+            title = cells[date_idx + 5] if len(cells) > date_idx + 5 else ""
+    except IndexError:
+        return None
+    if not (date_str and time_str and title):
+        return None
+    clean = _strip_instructor(title.strip(), provider.strip())
+    return {
+        "date": date_str,
+        "time": time_str.strip(),
+        "title": clean,
+        "location": _parse_location(clean),
+    }
+
+
+def scrape_all_events():
+    from playwright.sync_api import sync_playwright
+    events = []
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        try:
+            context = browser.new_context()
+            page = context.new_page()
+            page.set_default_timeout(60000)
+
+            log.info("navigating to sign-in")
+            page.goto(CFG["kipu_url"], wait_until="networkidle")
+            page.get_by_label("Email").fill(CFG["kipu_user"])
+            page.get_by_label("Password").fill(CFG["kipu_password"])
+            page.get_by_role("button", name="Sign In").click()
+            page.wait_for_url("**/portal", timeout=60000)
+            log.info("logged in")
+
+            page.goto(CFG["kipu_appointments_url"], wait_until="networkidle")
+
+            def scrape_current_page(label):
+                rows = page.query_selector_all("table tbody tr")
+                added = 0
+                for row in rows:
+                    cells = [c.inner_text().strip() for c in row.query_selector_all("td")]
+                    parsed = _parse_row(cells)
+                    if parsed:
+                        events.append(parsed)
+                        added += 1
+                log.info("  %s: %d rows -> %d events", label, len(rows), added)
+
+            for tab in ("Future", "Past"):
+                log.info("scraping %s tab", tab)
+                try:
+                    page.get_by_role("tab", name=tab).click(timeout=5000)
+                except Exception as e:
+                    log.warning("%s tab click: %s", tab, e)
+                page.wait_for_timeout(2000)
+                try:
+                    page.wait_for_selector("table tbody tr", timeout=25000)
+                except Exception:
+                    log.warning("no rows in %s tab", tab)
+                    continue
+                page_num = 1
+                while True:
+                    scrape_current_page(f"{tab} page {page_num}")
+                    next_btn = page.query_selector("button[aria-label='Next page']:not([disabled])")
+                    if not next_btn:
+                        break
+                    try:
+                        next_btn.click()
+                        page.wait_for_timeout(800)
+                    except Exception as e:
+                        log.warning("next page click failed: %s", e)
+                        break
+                    page_num += 1
+                    if page_num > 60:
+                        break
+        finally:
+            browser.close()
+
+    # Dedup on (date, time, title) — keeps first occurrence
+    seen = set()
+    unique = []
+    for ev in events:
+        k = (ev["date"], ev["time"], ev["title"])
+        if k in seen:
+            continue
+        seen.add(k)
+        unique.append(ev)
+    return unique
+
+
+# -----------------------------------------------------------------------------
+# State
+# -----------------------------------------------------------------------------
+def load_state():
+    if not STATE_PATH.exists() or STATE_PATH.stat().st_size == 0:
+        return {"meals_created": False, "last_today_items": []}
+    try:
+        return json.loads(STATE_PATH.read_text())
+    except json.JSONDecodeError:
+        return {"meals_created": False, "last_today_items": []}
+
+
+def save_state(s):
+    STATE_PATH.write_text(json.dumps(s, indent=2))
+
+
+# -----------------------------------------------------------------------------
+# Calendar helpers
+# -----------------------------------------------------------------------------
+def calendar_service():
+    """Build the Google Calendar service from the SA JSON in the env."""
+    # Write JSON to a temp file (google client can also take a dict, but
+    # from_service_account_info wants a dict — parse the env).
+    info = json.loads(CFG["gcal_sa_json"])
+    creds = service_account.Credentials.from_service_account_info(
+        info, scopes=["https://www.googleapis.com/auth/calendar"]
+    )
+    return build("calendar", "v3", credentials=creds, cache_discovery=False)
+
+
+def parse_time_to_minutes(t):
+    try:
+        dt = datetime.strptime(t.strip().lower(), "%I:%M %p")
+        return dt.hour * 60 + dt.minute
+    except ValueError:
+        return 0
+
+
+def parse_date_mmddyyyy(s):
+    try:
+        return datetime.strptime(s, "%m/%d/%Y").date()
+    except ValueError:
+        return None
+
+
+def kipu_key(ev):
+    """Stable ID for a Kipu event — used to match calendar events on subsequent runs."""
+    raw = f"{ev['date']}|{ev['time']}|{ev['title']}"
+    return hashlib.sha1(raw.encode()).hexdigest()[:16]
+
+
+def event_duration_minutes(title):
+    if CFG["short_event_hint"].lower() in title.lower():
+        return CFG["short_event_minutes"]
+    return CFG["default_event_minutes"]
+
+
+def event_should_remind(title):
+    return not any(s in title for s in CFG["skip_reminder_names"])
+
+
+def build_calendar_body(ev, tz_name):
+    start_date = parse_date_mmddyyyy(ev["date"])
+    if not start_date:
+        return None
+    mins = parse_time_to_minutes(ev["time"])
+    start_dt = datetime(start_date.year, start_date.month, start_date.day, mins // 60, mins % 60)
+    dur = event_duration_minutes(ev["title"])
+    end_dt = start_dt + timedelta(minutes=dur)
+    body = {
+        "summary": ev["title"],
+        "start": {"dateTime": start_dt.isoformat(timespec="seconds"), "timeZone": tz_name},
+        "end":   {"dateTime": end_dt.isoformat(timespec="seconds"),   "timeZone": tz_name},
+        "extendedProperties": {"private": {"kipu": "1", "kipu_key": kipu_key(ev)}},
+    }
+    loc = ev.get("location") or ""
+    if loc:
+        body["location"] = loc
+    if event_should_remind(ev["title"]):
+        body["reminders"] = {"useDefault": False, "overrides": [{"method": "popup", "minutes": CFG["reminder_minutes"]}]}
+    else:
+        body["reminders"] = {"useDefault": False, "overrides": []}
+    return body
+
+
+def list_managed_events(service, calendar_id):
+    """Fetch all events flagged as ours (kipu=1) from the calendar."""
+    out = {}
+    page_token = None
+    while True:
+        resp = service.events().list(
+            calendarId=calendar_id,
+            privateExtendedProperty="kipu=1",
+            maxResults=2500,
+            pageToken=page_token,
+            singleEvents=False,
+            showDeleted=False,
+        ).execute()
+        for e in resp.get("items", []):
+            props = e.get("extendedProperties", {}).get("private", {})
+            k = props.get("kipu_key")
+            if k:
+                out[k] = e
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+    return out
+
+
+def needs_update(existing, desired):
+    """Cheap comparison — did summary/start/end/location/reminders change?"""
+    def norm_dt(x):
+        return (x.get("dateTime") or x.get("date") or "").split("+")[0]
+    if existing.get("summary") != desired.get("summary"):
+        return True
+    if norm_dt(existing.get("start", {})) != norm_dt(desired["start"]):
+        return True
+    if norm_dt(existing.get("end", {})) != norm_dt(desired["end"]):
+        return True
+    if (existing.get("location") or "") != (desired.get("location") or ""):
+        return True
+    ex_rem = existing.get("reminders", {}).get("overrides") or []
+    de_rem = desired.get("reminders", {}).get("overrides") or []
+    if [(r.get("method"), r.get("minutes")) for r in ex_rem] != \
+       [(r.get("method"), r.get("minutes")) for r in de_rem]:
+        return True
+    return False
+
+
+# -----------------------------------------------------------------------------
+# Meal events (one-time create)
+# -----------------------------------------------------------------------------
+MEALS = [
+    ("Breakfast", "07:30", "09:00"),
+    ("Lunch",     "11:45", "13:00"),
+    ("Dinner",    "17:30", "19:00"),
+]
+
+
+def create_meal_events(service, calendar_id, tz_name):
+    """Create daily-recurring meal events, no reminders. Marked with meal=1."""
+    today = datetime.now(ZoneInfo(tz_name)).date()
+    for name, start, end in MEALS:
+        sh, sm = [int(x) for x in start.split(":")]
+        eh, em = [int(x) for x in end.split(":")]
+        start_dt = datetime(today.year, today.month, today.day, sh, sm)
+        end_dt   = datetime(today.year, today.month, today.day, eh, em)
+        body = {
+            "summary": name,
+            "start": {"dateTime": start_dt.isoformat(timespec="seconds"), "timeZone": tz_name},
+            "end":   {"dateTime": end_dt.isoformat(timespec="seconds"),   "timeZone": tz_name},
+            "recurrence": ["RRULE:FREQ=DAILY"],
+            "reminders": {"useDefault": False, "overrides": []},
+            "extendedProperties": {"private": {"kipu": "1", "meal": "1", "kipu_key": f"meal-{name.lower()}"}},
+        }
+        try:
+            service.events().insert(calendarId=calendar_id, body=body).execute()
+            log.info("created recurring meal: %s", name)
+        except HttpError as e:
+            log.error("failed to create meal %s: %s", name, e)
+
+
+# -----------------------------------------------------------------------------
+# SMS
+# -----------------------------------------------------------------------------
+def send_schedule_changed_sms():
+    body_text = "APN Lodge schedule has changed. Check your APN Lodge calendar."
+    msg = EmailMessage()
+    msg["From"] = CFG["gmail_user"]
+    msg["To"] = CFG["notify_to"]
+    msg.set_content(body_text)
+    ctx = ssl.create_default_context(cafile=_CAFILE) if _CAFILE else ssl.create_default_context()
+    with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as s:
+        s.starttls(context=ctx)
+        s.login(CFG["gmail_user"], CFG["gmail_app_password"].replace(" ", ""))
+        s.send_message(msg)
+    log.info("sent SMS notification")
+
+
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
+def sync_kipu_events(service, calendar_id, events, tz_name):
+    """Insert/update/delete Kipu-managed events (non-meal) to match `events`."""
+    existing = list_managed_events(service, calendar_id)
+    # Filter out meals from the "existing" map — never touch them.
+    existing = {k: e for k, e in existing.items()
+                if not e.get("extendedProperties", {}).get("private", {}).get("meal")}
+
+    desired_keys = set()
+    inserted = updated = 0
+    for ev in events:
+        key = kipu_key(ev)
+        desired_keys.add(key)
+        body = build_calendar_body(ev, tz_name)
+        if not body:
+            continue
+        if key in existing:
+            if needs_update(existing[key], body):
+                try:
+                    service.events().update(
+                        calendarId=calendar_id, eventId=existing[key]["id"], body=body
+                    ).execute()
+                    updated += 1
+                except HttpError as e:
+                    log.error("update failed for %s: %s", ev["title"], e)
+        else:
+            try:
+                service.events().insert(calendarId=calendar_id, body=body).execute()
+                inserted += 1
+            except HttpError as e:
+                log.error("insert failed for %s: %s", ev["title"], e)
+
+    deleted = 0
+    for key, e in existing.items():
+        if key not in desired_keys:
+            try:
+                service.events().delete(calendarId=calendar_id, eventId=e["id"]).execute()
+                deleted += 1
+            except HttpError as err:
+                log.error("delete failed: %s", err)
+
+    log.info("sync: %d inserted, %d updated, %d deleted (%d desired)",
+             inserted, updated, deleted, len(desired_keys))
+    return inserted, updated, deleted
+
+
+def main():
+    tz_name = CFG["timezone"]
+    tz = ZoneInfo(tz_name)
+    now = datetime.now(tz)
+    today_str = now.date().strftime("%m/%d/%Y")
+    log.info("=== run at %s ===", now.isoformat(timespec="seconds"))
+
+    state = load_state()
+
+    # 1) Scrape
+    try:
+        events = scrape_all_events()
+    except Exception as e:
+        log.exception("scrape failed: %s", e)
+        try:
+            send_schedule_changed_sms()  # at least alert Ben something's off
+        except Exception:
+            pass
+        save_state(state)
+        sys.exit(1)
+    log.info("scraped %d unique events", len(events))
+
+    # 2) Calendar sync
+    service = calendar_service()
+    calendar_id = CFG["gcal_calendar_id"]
+
+    if not state.get("meals_created"):
+        create_meal_events(service, calendar_id, tz_name)
+        state["meals_created"] = True
+
+    ins, upd, dele = sync_kipu_events(service, calendar_id, events, tz_name)
+
+    # 3) SMS on today diff
+    today_items = sorted(
+        [{"time": ev["time"], "title": ev["title"]} for ev in events if ev["date"] == today_str],
+        key=lambda x: parse_time_to_minutes(x["time"]),
+    )
+    last = state.get("last_today_items", [])
+    if last and today_items != last:
+        try:
+            send_schedule_changed_sms()
+        except Exception as e:
+            log.error("SMS send failed: %s", e)
+    state["last_today_items"] = today_items
+
+    save_state(state)
+    log.info("done: sync %d/%d/%d, %d items today", ins, upd, dele, len(today_items))
+
+
+if __name__ == "__main__":
+    main()
