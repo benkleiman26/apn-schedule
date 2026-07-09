@@ -83,6 +83,8 @@ CFG = {
     "default_event_minutes": 60,
     "short_event_minutes": 15,
     "short_event_hint": "Vitals & Med Pass",
+    # Ben's schedule: 8am, 1pm, and 3pm slots are always 2 hours (per Ben)
+    "two_hour_slots": {"08:00 am", "01:00 pm", "03:00 pm"},
 }
 
 CWD = Path.cwd()
@@ -183,18 +185,46 @@ def scrape_all_events():
                         added += 1
                 log.info("  %s: %d rows -> %d events", label, len(rows), added)
 
-            for tab in ("Future", "Past"):
+            import urllib.parse
+            today_iso = datetime.now(ZoneInfo(CFG["timezone"])).date().isoformat()
+            # Backfill window (Ben arrived ~6/29 — pull 90 days back to be safe)
+            far_past = "2026-01-01"
+
+            for tab, search_key, options_key, from_date, to_date in [
+                ("Future", "futureSearch", "futureOptions", today_iso, "2027-01-01"),
+                ("Past",   "pastSearch",   "pastOptions",   far_past,  today_iso),
+            ]:
                 log.info("scraping %s tab", tab)
-                try:
-                    page.get_by_role("tab", name=tab).click(timeout=5000)
-                except Exception as e:
-                    log.warning("%s tab click: %s", tab, e)
-                page.wait_for_timeout(2000)
-                try:
-                    page.wait_for_selector("table tbody tr", timeout=25000)
-                except Exception:
-                    log.warning("no rows in %s tab", tab)
+                # Build URL with tab pre-selected and wide date range + big page size.
+                q = urllib.parse.urlencode({
+                    "account_id": "160244",
+                    "selectedTab": tab,
+                    search_key: json.dumps({"fromDate": from_date, "toDate": to_date}),
+                    options_key: json.dumps({"page": 1, "itemsPerPage": 100}),
+                })
+                url = f"https://apn11031.kipuworks.com/portal/appointments?{q}"
+                page.goto(url, wait_until="networkidle")
+
+                # Also explicitly click the tab in case URL param alone doesn't switch it.
+                for attempt in range(3):
+                    try:
+                        page.get_by_role("tab", name=tab).click(timeout=5000)
+                    except Exception as e:
+                        log.warning("%s tab click attempt %d: %s", tab, attempt, e)
+                    page.wait_for_timeout(2500)
+                    rows = page.query_selector_all("table tbody tr")
+                    if rows:
+                        break
+                if not rows:
+                    log.warning("no rows in %s tab after retries", tab)
+                    # Save debug screenshot to artifacts
+                    try:
+                        page.screenshot(path=f"debug-{tab.lower()}.png")
+                        log.info("saved debug-%s.png", tab.lower())
+                    except Exception:
+                        pass
                     continue
+
                 page_num = 1
                 while True:
                     scrape_current_page(f"{tab} page {page_num}")
@@ -203,7 +233,7 @@ def scrape_all_events():
                         break
                     try:
                         next_btn.click()
-                        page.wait_for_timeout(800)
+                        page.wait_for_timeout(1000)
                     except Exception as e:
                         log.warning("next page click failed: %s", e)
                         break
@@ -276,9 +306,13 @@ def kipu_key(ev):
     return hashlib.sha1(raw.encode()).hexdigest()[:16]
 
 
-def event_duration_minutes(title):
+def event_duration_minutes(title, time_str=""):
+    # Vitals always short — overrides everything else.
     if CFG["short_event_hint"].lower() in title.lower():
         return CFG["short_event_minutes"]
+    # Ben's fixed 2-hour slots.
+    if time_str.strip().lower() in CFG["two_hour_slots"]:
+        return 120
     return CFG["default_event_minutes"]
 
 
@@ -292,7 +326,7 @@ def build_calendar_body(ev, tz_name):
         return None
     mins = parse_time_to_minutes(ev["time"])
     start_dt = datetime(start_date.year, start_date.month, start_date.day, mins // 60, mins % 60)
-    dur = event_duration_minutes(ev["title"])
+    dur = event_duration_minutes(ev["title"], ev["time"])
     end_dt = start_dt + timedelta(minutes=dur)
     body = {
         "summary": ev["title"],
@@ -355,19 +389,34 @@ def needs_update(existing, desired):
 
 
 # -----------------------------------------------------------------------------
-# Meal events (one-time create)
+# Standing events (meals + gym) — recurring daily, no reminders. Idempotent.
 # -----------------------------------------------------------------------------
-MEALS = [
-    ("Breakfast", "07:30", "09:00"),
-    ("Lunch",     "11:45", "13:00"),
-    ("Dinner",    "17:30", "19:00"),
+STANDING_EVENTS = [
+    # (name, start HH:MM, end HH:MM)
+    ("Breakfast",  "07:30", "09:00"),
+    ("Lunch",      "11:45", "13:00"),
+    ("Dinner",     "17:30", "19:00"),
+    ("Gym",        "06:00", "07:00"),
+    ("Gym",        "16:30", "18:00"),
 ]
 
 
-def create_meal_events(service, calendar_id, tz_name):
-    """Create daily-recurring meal events, no reminders. Marked with meal=1."""
+def _standing_key(name, start):
+    """Stable key for a standing event, distinct per (name, start)."""
+    slug = f"{name}-{start.replace(':', '')}".lower()
+    return f"standing-{slug}"
+
+
+def sync_standing_events(service, calendar_id, tz_name):
+    """Create any standing events that aren't already on the calendar. Never modifies existing ones."""
+    # Fetch existing kipu_keys once
+    existing = list_managed_events(service, calendar_id)
+    existing_keys = set(existing.keys())
     today = datetime.now(ZoneInfo(tz_name)).date()
-    for name, start, end in MEALS:
+    for name, start, end in STANDING_EVENTS:
+        key = _standing_key(name, start)
+        if key in existing_keys:
+            continue
         sh, sm = [int(x) for x in start.split(":")]
         eh, em = [int(x) for x in end.split(":")]
         start_dt = datetime(today.year, today.month, today.day, sh, sm)
@@ -378,13 +427,13 @@ def create_meal_events(service, calendar_id, tz_name):
             "end":   {"dateTime": end_dt.isoformat(timespec="seconds"),   "timeZone": tz_name},
             "recurrence": ["RRULE:FREQ=DAILY"],
             "reminders": {"useDefault": False, "overrides": []},
-            "extendedProperties": {"private": {"kipu": "1", "meal": "1", "kipu_key": f"meal-{name.lower()}"}},
+            "extendedProperties": {"private": {"kipu": "1", "standing": "1", "kipu_key": key}},
         }
         try:
             service.events().insert(calendarId=calendar_id, body=body).execute()
-            log.info("created recurring meal: %s", name)
+            log.info("created standing event: %s @ %s", name, start)
         except HttpError as e:
-            log.error("failed to create meal %s: %s", name, e)
+            log.error("failed to create standing event %s @ %s: %s", name, start, e)
 
 
 # -----------------------------------------------------------------------------
@@ -408,11 +457,13 @@ def send_schedule_changed_sms():
 # Main
 # -----------------------------------------------------------------------------
 def sync_kipu_events(service, calendar_id, events, tz_name):
-    """Insert/update/delete Kipu-managed events (non-meal) to match `events`."""
+    """Insert/update/delete Kipu-managed events (non-standing) to match `events`."""
     existing = list_managed_events(service, calendar_id)
-    # Filter out meals from the "existing" map — never touch them.
+    # Filter out standing events (meals, gym) — never delete/update those from Kipu sync.
+    # Also skip the legacy "meal=1" marker for events created by earlier code.
     existing = {k: e for k, e in existing.items()
-                if not e.get("extendedProperties", {}).get("private", {}).get("meal")}
+                if not e.get("extendedProperties", {}).get("private", {}).get("standing")
+                and not e.get("extendedProperties", {}).get("private", {}).get("meal")}
 
     desired_keys = set()
     inserted = updated = 0
@@ -439,13 +490,25 @@ def sync_kipu_events(service, calendar_id, events, tz_name):
                 log.error("insert failed for %s: %s", ev["title"], e)
 
     deleted = 0
+    today = datetime.now(ZoneInfo(tz_name)).date()
     for key, e in existing.items():
-        if key not in desired_keys:
-            try:
-                service.events().delete(calendarId=calendar_id, eventId=e["id"]).execute()
-                deleted += 1
-            except HttpError as err:
-                log.error("delete failed: %s", err)
+        if key in desired_keys:
+            continue
+        # Only delete events dated TODAY or later. Never touch historical events
+        # — Ben wants a persistent record of what he attended, and Kipu prunes
+        # its Past tab over time.
+        start_str = e.get("start", {}).get("dateTime") or e.get("start", {}).get("date") or ""
+        try:
+            ev_date = datetime.fromisoformat(start_str.split("T")[0]).date()
+        except ValueError:
+            continue
+        if ev_date < today:
+            continue
+        try:
+            service.events().delete(calendarId=calendar_id, eventId=e["id"]).execute()
+            deleted += 1
+        except HttpError as err:
+            log.error("delete failed: %s", err)
 
     log.info("sync: %d inserted, %d updated, %d deleted (%d desired)",
              inserted, updated, deleted, len(desired_keys))
@@ -478,9 +541,9 @@ def main():
     service = calendar_service()
     calendar_id = CFG["gcal_calendar_id"]
 
-    if not state.get("meals_created"):
-        create_meal_events(service, calendar_id, tz_name)
-        state["meals_created"] = True
+    # Idempotently ensure standing events (meals + gym) exist. Never touches
+    # existing ones — only inserts missing.
+    sync_standing_events(service, calendar_id, tz_name)
 
     ins, upd, dele = sync_kipu_events(service, calendar_id, events, tz_name)
 
