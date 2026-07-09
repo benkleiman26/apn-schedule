@@ -185,61 +185,122 @@ def scrape_all_events():
                         added += 1
                 log.info("  %s: %d rows -> %d events", label, len(rows), added)
 
-            import urllib.parse
-            today_iso = datetime.now(ZoneInfo(CFG["timezone"])).date().isoformat()
-            # Backfill window (Ben arrived ~6/29 — pull 90 days back to be safe)
-            far_past = "2026-01-01"
+            today_local = datetime.now(ZoneInfo(CFG["timezone"])).date()
+            today_str = today_local.strftime("%m/%d/%Y")
 
-            for tab, search_key, options_key, from_date, to_date in [
-                ("Future", "futureSearch", "futureOptions", today_iso, "2027-01-01"),
-                ("Past",   "pastSearch",   "pastOptions",   far_past,  today_iso),
-            ]:
-                log.info("scraping %s tab", tab)
-                # Build URL with tab pre-selected and wide date range + big page size.
-                q = urllib.parse.urlencode({
-                    "account_id": "160244",
-                    "selectedTab": tab,
-                    search_key: json.dumps({"fromDate": from_date, "toDate": to_date}),
-                    options_key: json.dumps({"page": 1, "itemsPerPage": 100}),
-                })
-                url = f"https://apn11031.kipuworks.com/portal/appointments?{q}"
-                page.goto(url, wait_until="networkidle")
-
-                # Also explicitly click the tab in case URL param alone doesn't switch it.
-                for attempt in range(3):
-                    try:
-                        page.get_by_role("tab", name=tab).click(timeout=5000)
-                    except Exception as e:
-                        log.warning("%s tab click attempt %d: %s", tab, attempt, e)
-                    page.wait_for_timeout(2500)
+            def wait_for_data_rows(label, expect_date_substr=None, timeout=25000):
+                """Wait until table has rows AND (optionally) the desired-date substring
+                appears in cells. Returns count of rows found (or 0)."""
+                deadline = datetime.now().timestamp() + (timeout / 1000)
+                while datetime.now().timestamp() < deadline:
                     rows = page.query_selector_all("table tbody tr")
                     if rows:
-                        break
-                if not rows:
-                    log.warning("no rows in %s tab after retries", tab)
-                    # Save debug screenshot to artifacts
-                    try:
-                        page.screenshot(path=f"debug-{tab.lower()}.png")
-                        log.info("saved debug-%s.png", tab.lower())
-                    except Exception:
-                        pass
-                    continue
+                        if not expect_date_substr:
+                            return len(rows)
+                        # Peek at the first cell content — do any cells contain the substring?
+                        first_row_text = rows[0].inner_text() if rows else ""
+                        if expect_date_substr in first_row_text:
+                            return len(rows)
+                    page.wait_for_timeout(500)
+                log.warning("wait_for_data_rows(%s) timed out", label)
+                return 0
 
+            def paginate_and_scrape(label):
                 page_num = 1
+                total = 0
                 while True:
-                    scrape_current_page(f"{tab} page {page_num}")
+                    n = len(page.query_selector_all("table tbody tr"))
+                    scrape_current_page(f"{label} page {page_num}")
+                    total += n
                     next_btn = page.query_selector("button[aria-label='Next page']:not([disabled])")
                     if not next_btn:
                         break
                     try:
                         next_btn.click()
-                        page.wait_for_timeout(1000)
+                        page.wait_for_timeout(1200)
                     except Exception as e:
-                        log.warning("next page click failed: %s", e)
+                        log.warning("next page click failed on %s p%d: %s", label, page_num, e)
                         break
                     page_num += 1
                     if page_num > 60:
                         break
+                log.info("%s: total pages=%d rows_seen=%d", label, page_num, total)
+
+            # ---------- FUTURE tab (default when we land on appointments page) ----------
+            log.info("scraping Future tab")
+            page.goto(cfg_url := "https://apn11031.kipuworks.com/portal/appointments?account_id=160244", wait_until="networkidle")
+            wait_for_data_rows("Future", expect_date_substr="20", timeout=25000)
+            # Make sure Future tab is selected
+            try:
+                page.get_by_role("tab", name="Future").click(timeout=5000)
+                page.wait_for_timeout(1500)
+            except Exception as e:
+                log.warning("Future tab click: %s", e)
+            paginate_and_scrape("Future")
+
+            # ---------- PAST tab ----------
+            log.info("scraping Past tab")
+            # Explicit click with wait for aria-selected. Retry if needed.
+            switched = False
+            for attempt in range(4):
+                try:
+                    past_tab = page.get_by_role("tab", name="Past")
+                    past_tab.wait_for(state="visible", timeout=8000)
+                    past_tab.click()
+                except Exception as e:
+                    log.warning("Past tab click attempt %d: %s", attempt, e)
+                    page.wait_for_timeout(1500)
+                    continue
+                # Wait for the switch to actually happen — table body should reload.
+                page.wait_for_timeout(3000)
+                # Check if Past tab is now aria-selected
+                try:
+                    aria = past_tab.get_attribute("aria-selected")
+                    if aria == "true":
+                        switched = True
+                        break
+                except Exception:
+                    pass
+            if not switched:
+                log.warning("could not confirm Past tab active; scraping whatever is visible")
+
+            n_rows = wait_for_data_rows("Past initial", timeout=30000)
+            if n_rows == 0:
+                log.error("no rows in Past tab at all; skipping")
+                try:
+                    page.screenshot(path="debug-past.png")
+                    log.info("saved debug-past.png")
+                except Exception:
+                    pass
+            else:
+                # Jump to the LAST page of Past (today's morning items land there
+                # because Past sorts ascending). Then walk backward, scraping each page.
+                try:
+                    last_btn = page.query_selector("button[aria-label='Last page']:not([disabled])")
+                    if last_btn:
+                        log.info("Past: clicking Last page to jump to today's items")
+                        last_btn.click()
+                        page.wait_for_timeout(1500)
+                    else:
+                        log.info("Past: no Last page btn — single page")
+                except Exception as e:
+                    log.warning("Past last-page click failed: %s", e)
+
+                # Walk backward through Past pages until we hit page 1 or safety limit.
+                pg = 0
+                while pg < 15:
+                    pg += 1
+                    scrape_current_page(f"Past reverse p{pg}")
+                    prev_btn = page.query_selector("button[aria-label='Previous page']:not([disabled])")
+                    if not prev_btn:
+                        break
+                    try:
+                        prev_btn.click()
+                        page.wait_for_timeout(1200)
+                    except Exception as e:
+                        log.warning("Past prev click failed: %s", e)
+                        break
+                log.info("Past: walked back %d pages", pg)
         finally:
             browser.close()
 
@@ -408,14 +469,44 @@ def _standing_key(name, start):
 
 
 def sync_standing_events(service, calendar_id, tz_name):
-    """Create any standing events that aren't already on the calendar. Never modifies existing ones."""
-    # Fetch existing kipu_keys once
+    """Create any standing events that aren't already on the calendar.
+
+    Dedup logic is by (summary, start hour:min) instead of by kipu_key, so
+    that any pre-existing standing events (including ones created under an
+    older key format) are recognized. Never modifies existing events.
+    """
     existing = list_managed_events(service, calendar_id)
-    existing_keys = set(existing.keys())
+    # Build a set of (summary, HH:MM) already present, plus a dupe-detection map.
+    existing_by_sig = {}
+    dup_ids = []
+    for k, e in existing.items():
+        summ = (e.get("summary") or "").strip()
+        st = e.get("start", {}).get("dateTime", "")
+        # extract HH:MM from the RFC3339 dateTime (strip TZ)
+        hhmm = ""
+        if "T" in st:
+            hhmm = st.split("T", 1)[1][:5]
+        sig = (summ, hhmm)
+        if not summ or not hhmm:
+            continue
+        if sig in existing_by_sig:
+            # Second copy of the same standing event — mark for cleanup.
+            dup_ids.append(e["id"])
+        else:
+            existing_by_sig[sig] = e
+
+    # Delete duplicate standing events (leftover from schema change).
+    for eid in dup_ids:
+        try:
+            service.events().delete(calendarId=calendar_id, eventId=eid).execute()
+            log.info("deleted duplicate standing event id=%s", eid)
+        except HttpError as e:
+            log.warning("dup cleanup delete failed: %s", e)
+
     today = datetime.now(ZoneInfo(tz_name)).date()
     for name, start, end in STANDING_EVENTS:
-        key = _standing_key(name, start)
-        if key in existing_keys:
+        sig = (name, start)
+        if sig in existing_by_sig:
             continue
         sh, sm = [int(x) for x in start.split(":")]
         eh, em = [int(x) for x in end.split(":")]
@@ -427,7 +518,7 @@ def sync_standing_events(service, calendar_id, tz_name):
             "end":   {"dateTime": end_dt.isoformat(timespec="seconds"),   "timeZone": tz_name},
             "recurrence": ["RRULE:FREQ=DAILY"],
             "reminders": {"useDefault": False, "overrides": []},
-            "extendedProperties": {"private": {"kipu": "1", "standing": "1", "kipu_key": key}},
+            "extendedProperties": {"private": {"kipu": "1", "standing": "1", "kipu_key": _standing_key(name, start)}},
         }
         try:
             service.events().insert(calendarId=calendar_id, body=body).execute()
