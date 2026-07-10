@@ -10,8 +10,7 @@ Runs on GH Actions cron. On each run:
        never touch events created by the user manually.
   3. On the FIRST run, also inserts three recurring daily meal events
      (Breakfast, Lunch, Dinner) as ours-forever events.
-  4. Sends SMS "Your schedule has changed" via Verizon vtext if today's items
-     changed vs. the last snapshot.
+  SMS notifications are disabled — calendar sync is the sole source of truth.
 
 Reminders are handled natively by Google Calendar per-event:
   * Kipu events: 30-min popup, except any name in SKIP_REMINDER_NAMES
@@ -33,23 +32,14 @@ import json
 import logging
 import os
 import re
-import smtplib
-import ssl
 import sys
 import tempfile
 from datetime import datetime, timedelta, date
-from email.message import EmailMessage
 from pathlib import Path
 try:
     from zoneinfo import ZoneInfo
 except ImportError:
     from backports.zoneinfo import ZoneInfo
-
-try:
-    import certifi
-    _CAFILE = certifi.where()
-except ImportError:
-    _CAFILE = None
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -532,23 +522,6 @@ def sync_standing_events(service, calendar_id, tz_name):
 
 
 # -----------------------------------------------------------------------------
-# SMS
-# -----------------------------------------------------------------------------
-def send_schedule_changed_sms():
-    body_text = "APN Lodge schedule has changed. Check your APN Lodge calendar."
-    msg = EmailMessage()
-    msg["From"] = CFG["gmail_user"]
-    msg["To"] = CFG["notify_to"]
-    msg.set_content(body_text)
-    ctx = ssl.create_default_context(cafile=_CAFILE) if _CAFILE else ssl.create_default_context()
-    with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as s:
-        s.starttls(context=ctx)
-        s.login(CFG["gmail_user"], CFG["gmail_app_password"].replace(" ", ""))
-        s.send_message(msg)
-    log.info("sent SMS notification")
-
-
-# -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
 def sync_kipu_events(service, calendar_id, events, tz_name):
@@ -614,7 +587,6 @@ def main():
     tz_name = CFG["timezone"]
     tz = ZoneInfo(tz_name)
     now = datetime.now(tz)
-    today_str = now.date().strftime("%m/%d/%Y")
     log.info("=== run at %s ===", now.isoformat(timespec="seconds"))
 
     state = load_state()
@@ -624,10 +596,6 @@ def main():
         events = scrape_all_events()
     except Exception as e:
         log.exception("scrape failed: %s", e)
-        try:
-            send_schedule_changed_sms()  # at least alert Ben something's off
-        except Exception:
-            pass
         save_state(state)
         sys.exit(1)
     log.info("scraped %d unique events", len(events))
@@ -642,21 +610,8 @@ def main():
 
     ins, upd, dele = sync_kipu_events(service, calendar_id, events, tz_name)
 
-    # 3) SMS on today diff
-    today_items = sorted(
-        [{"time": ev["time"], "title": ev["title"]} for ev in events if ev["date"] == today_str],
-        key=lambda x: parse_time_to_minutes(x["time"]),
-    )
-    last = state.get("last_today_items", [])
-    if last and today_items != last:
-        try:
-            send_schedule_changed_sms()
-        except Exception as e:
-            log.error("SMS send failed: %s", e)
-    state["last_today_items"] = today_items
-
     save_state(state)
-    log.info("done: sync %d/%d/%d, %d items today", ins, upd, dele, len(today_items))
+    log.info("done: sync %d/%d/%d", ins, upd, dele)
 
 
 if __name__ == "__main__":
