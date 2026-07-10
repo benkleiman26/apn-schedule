@@ -188,35 +188,58 @@ def scrape_all_events():
             today_local = datetime.now(ZoneInfo(CFG["timezone"])).date()
             today_str = today_local.strftime("%m/%d/%Y")
 
-            def wait_for_data_rows(label, expect_date_substr=None, timeout=25000):
-                """Wait until table has rows AND (optionally) the desired-date substring
-                appears in cells. Returns count of rows found (or 0)."""
+            def get_visible_rows():
+                """Return tbody rows from the visible (active tab) table only.
+                Vuetify keeps both Future and Past tables in the DOM; we must
+                filter to only the visible one to avoid double-scraping and
+                to hit the correct pagination buttons."""
+                tables = page.query_selector_all("table")
+                for t in tables:
+                    if t.is_visible():
+                        return t.query_selector_all("tbody tr")
+                return []
+
+            def get_visible_button(aria_label):
+                """Return the visible :not([disabled]) button matching aria_label,
+                or None. Filters to visible ones so we don't try to click a
+                hidden button in the inactive tab (which times out)."""
+                btns = page.query_selector_all(f"button[aria-label='{aria_label}']:not([disabled])")
+                for b in btns:
+                    if b.is_visible():
+                        return b
+                return None
+
+            def wait_for_data_rows(label, timeout=30000):
                 deadline = datetime.now().timestamp() + (timeout / 1000)
                 while datetime.now().timestamp() < deadline:
-                    rows = page.query_selector_all("table tbody tr")
+                    rows = get_visible_rows()
                     if rows:
-                        if not expect_date_substr:
-                            return len(rows)
-                        # Peek at the first cell content — do any cells contain the substring?
-                        first_row_text = rows[0].inner_text() if rows else ""
-                        if expect_date_substr in first_row_text:
-                            return len(rows)
+                        return len(rows)
                     page.wait_for_timeout(500)
                 log.warning("wait_for_data_rows(%s) timed out", label)
                 return 0
 
+            def scrape_visible_page(label):
+                rows = get_visible_rows()
+                added = 0
+                for row in rows:
+                    cells = [c.inner_text().strip() for c in row.query_selector_all("td")]
+                    parsed = _parse_row(cells)
+                    if parsed:
+                        events.append(parsed)
+                        added += 1
+                log.info("  %s: %d rows -> %d events", label, len(rows), added)
+                return len(rows)
+
             def paginate_and_scrape(label):
                 page_num = 1
-                total = 0
                 while True:
-                    n = len(page.query_selector_all("table tbody tr"))
-                    scrape_current_page(f"{label} page {page_num}")
-                    total += n
-                    next_btn = page.query_selector("button[aria-label='Next page']:not([disabled])")
+                    scrape_visible_page(f"{label} page {page_num}")
+                    next_btn = get_visible_button("Next page")
                     if not next_btn:
                         break
                     try:
-                        next_btn.click()
+                        next_btn.click(timeout=8000)
                         page.wait_for_timeout(1200)
                     except Exception as e:
                         log.warning("next page click failed on %s p%d: %s", label, page_num, e)
@@ -224,23 +247,17 @@ def scrape_all_events():
                     page_num += 1
                     if page_num > 60:
                         break
-                log.info("%s: total pages=%d rows_seen=%d", label, page_num, total)
+                log.info("%s: scraped %d pages", label, page_num)
 
             # ---------- FUTURE tab (default when we land on appointments page) ----------
             log.info("scraping Future tab")
-            page.goto(cfg_url := "https://apn11031.kipuworks.com/portal/appointments?account_id=160244", wait_until="networkidle")
-            wait_for_data_rows("Future", expect_date_substr="20", timeout=25000)
-            # Make sure Future tab is selected
-            try:
-                page.get_by_role("tab", name="Future").click(timeout=5000)
-                page.wait_for_timeout(1500)
-            except Exception as e:
-                log.warning("Future tab click: %s", e)
+            page.goto("https://apn11031.kipuworks.com/portal/appointments?account_id=160244", wait_until="networkidle")
+            wait_for_data_rows("Future initial")
             paginate_and_scrape("Future")
 
             # ---------- PAST tab ----------
             log.info("scraping Past tab")
-            # Explicit click with wait for aria-selected. Retry if needed.
+            # Click Past; verify aria-selected becomes true so we know the swap happened.
             switched = False
             for attempt in range(4):
                 try:
@@ -251,9 +268,7 @@ def scrape_all_events():
                     log.warning("Past tab click attempt %d: %s", attempt, e)
                     page.wait_for_timeout(1500)
                     continue
-                # Wait for the switch to actually happen — table body should reload.
-                page.wait_for_timeout(3000)
-                # Check if Past tab is now aria-selected
+                page.wait_for_timeout(2500)
                 try:
                     aria = past_tab.get_attribute("aria-selected")
                     if aria == "true":
@@ -264,43 +279,15 @@ def scrape_all_events():
             if not switched:
                 log.warning("could not confirm Past tab active; scraping whatever is visible")
 
-            n_rows = wait_for_data_rows("Past initial", timeout=30000)
+            n_rows = wait_for_data_rows("Past initial")
             if n_rows == 0:
-                log.error("no rows in Past tab at all; skipping")
-                try:
-                    page.screenshot(path="debug-past.png")
-                    log.info("saved debug-past.png")
-                except Exception:
-                    pass
+                log.error("no rows in Past tab; skipping backfill")
             else:
-                # Jump to the LAST page of Past (today's morning items land there
-                # because Past sorts ascending). Then walk backward, scraping each page.
-                try:
-                    last_btn = page.query_selector("button[aria-label='Last page']:not([disabled])")
-                    if last_btn:
-                        log.info("Past: clicking Last page to jump to today's items")
-                        last_btn.click()
-                        page.wait_for_timeout(1500)
-                    else:
-                        log.info("Past: no Last page btn — single page")
-                except Exception as e:
-                    log.warning("Past last-page click failed: %s", e)
-
-                # Walk backward through Past pages until we hit page 1 or safety limit.
-                pg = 0
-                while pg < 15:
-                    pg += 1
-                    scrape_current_page(f"Past reverse p{pg}")
-                    prev_btn = page.query_selector("button[aria-label='Previous page']:not([disabled])")
-                    if not prev_btn:
-                        break
-                    try:
-                        prev_btn.click()
-                        page.wait_for_timeout(1200)
-                    except Exception as e:
-                        log.warning("Past prev click failed: %s", e)
-                        break
-                log.info("Past: walked back %d pages", pg)
+                # Walk forward through all Past pages. Past is ascending oldest→newest,
+                # so walking forward covers 6/29 → today. We do NOT use Last-page-jump
+                # + backward walk anymore because Vuetify keeps both tab tables in the
+                # DOM and the hidden Future pagination buttons intercept clicks.
+                paginate_and_scrape("Past")
         finally:
             browser.close()
 
@@ -476,13 +463,25 @@ def sync_standing_events(service, calendar_id, tz_name):
     older key format) are recognized. Never modifies existing events.
     """
     existing = list_managed_events(service, calendar_id)
-    # Build a set of (summary, HH:MM) already present, plus a dupe-detection map.
+    # Build a set of (summary, HH:MM) already present *among STANDING events only*.
+    # A standing event is one with extendedProperties.private.standing=1 OR the
+    # legacy meal=1 marker OR a `recurrence` field. We must NEVER dedup individual
+    # Kipu appointment instances (which share summaries across dates).
     existing_by_sig = {}
     dup_ids = []
+    STANDING_NAMES = {name for (name, _, _) in STANDING_EVENTS}
     for k, e in existing.items():
+        props = e.get("extendedProperties", {}).get("private", {}) or {}
+        is_standing = (
+            props.get("standing") == "1"
+            or props.get("meal") == "1"
+            or bool(e.get("recurrence"))
+            or (e.get("summary", "").strip() in STANDING_NAMES and bool(e.get("recurrence")))
+        )
+        if not is_standing:
+            continue
         summ = (e.get("summary") or "").strip()
         st = e.get("start", {}).get("dateTime", "")
-        # extract HH:MM from the RFC3339 dateTime (strip TZ)
         hhmm = ""
         if "T" in st:
             hhmm = st.split("T", 1)[1][:5]
@@ -490,10 +489,15 @@ def sync_standing_events(service, calendar_id, tz_name):
         if not summ or not hhmm:
             continue
         if sig in existing_by_sig:
-            # Second copy of the same standing event — mark for cleanup.
             dup_ids.append(e["id"])
         else:
             existing_by_sig[sig] = e
+
+    # Safety: never delete more than 10 events in one run.
+    if len(dup_ids) > 10:
+        log.error("REFUSING to delete %d 'duplicate' events — safety cap. Log: %s",
+                  len(dup_ids), dup_ids[:5])
+        dup_ids = []
 
     # Delete duplicate standing events (leftover from schema change).
     for eid in dup_ids:
